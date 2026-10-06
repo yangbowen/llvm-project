@@ -423,8 +423,10 @@ ErrorOr<int> File::seek(off_t offset, int whence) {
   // readable.
   eof = false;
   if (orientation == Orientation::WIDE ||
-      orientation == Orientation::UNORIENTED)
-    mbstate = internal::mbstate();
+      orientation == Orientation::UNORIENTED) {
+    mbstate_write = internal::mbstate();
+    mbstate_read = internal::mbstate();
+  }
 
   return 0;
 }
@@ -467,17 +469,22 @@ int File::flush_unlocked() {
 // Does the following:
 // 1. If in write mode, Write out any data present in the buffer.
 // 2. Call platform_close.
+// 3. (UTF-16) If mbstate_write still holds an unpaired high surrogate, return
+//    EILSEQ to signal that the code unit cannot be encoded.
 // platform_close is expected to cleanup the complete file object.
 int File::close() {
+  int result = 0;
   {
     FileLock lock(this);
     if (prev_op == FileOp::WRITE && pos > 0) {
       auto buf_result = platform_write(this, buf, pos);
       if (buf_result.has_error() || buf_result.value < pos) {
-        err = true;
-        return buf_result.error;
+        result = buf_result.error;
       }
     }
+    if (result == 0)
+      result = check_mbstate_partial_push_unlocked();
+    if (result != 0) err = true;
   }
 
   // If we own the buffer, delete it before calling the platform close
@@ -490,7 +497,8 @@ int File::close() {
   // includes the file mutex. Hence, we call platform_close after releasing
   // the file lock. Another thread doing file operations while a thread is
   // closing the file is undefined behavior as per POSIX.
-  return platform_close(this);
+  int close_result = platform_close(this);
+  return result != 0 ? result : close_result;
 }
 
 int File::set_buffer(void *buffer, size_t size, int buffer_mode) {
@@ -557,13 +565,17 @@ FileIOResult File::write_unlocked(const wchar_t *ws, size_t len) {
   }
 
   size_t written = 0;
-  for (size_t i = 0; i < len; ++i) {
-    internal::CharacterConverter cr(&mbstate);
-    int push_err = cr.push(static_cast<char32_t>(ws[i]));
+  for (; written < len; ++written) {
+    internal::CharacterConverter cr(&mbstate_write);
+    int push_err = cr.push(ws[written]);
     if (push_err != 0) {
       err = true;
       return {written, push_err};
     }
+    // (UTF-16) Continue to read the next wchar_t before popping.
+    // Note that written is incremented even though we don't yet know whether
+    // the just-pushed wchar_t will write successfully.
+    if (!cr.isFull()) continue;
     // buffer the whole wchar to save on calls to write.
     char buffer[4];
     size_t char_size = 0;
@@ -574,17 +586,18 @@ FileIOResult File::write_unlocked(const wchar_t *ws, size_t len) {
         return {written, pop_res.error()};
       }
       char8_t byte = pop_res.value();
-      buffer[char_size] = byte;
+      buffer[char_size] = static_cast<char>(byte);
       ++char_size;
     }
     auto write_res = write_unlocked_impl(buffer, char_size);
-    if (write_res.has_error())
+    if (write_res.has_error()) {
+      err = true;
       return {written, write_res.error};
+    }
     if (write_res.value < char_size) {
       err = true;
       return {written, EIO};
     }
-    ++written;
   }
   return {written, 0};
 }
@@ -603,31 +616,37 @@ FileIOResult File::read_unlocked(wchar_t *ws, size_t len) {
 
   size_t read_count = 0;
   for (size_t i = 0; i < len; ++i) {
-    internal::CharacterConverter cr(&mbstate);
-    while (!cr.isFull()) {
-      uint8_t byte;
-      auto read_res = read_unlocked_impl(&byte, 1);
-      if (read_res.has_error())
-        return {read_count, read_res.error};
-      if (read_res.value == 0) { // EOF
-        if (cr.isEmpty())
-          return {read_count, 0};
-        err = true;
-        return {read_count, EILSEQ}; // Incomplete character at EOF
-      }
-      int push_err = cr.push(static_cast<char8_t>(byte));
-      if (push_err != 0) {
-        err = true;
-        return {read_count, push_err};
+    internal::CharacterConverter cr(&mbstate_read);
+    // (UTF-16) If part of a complete char32 still resides in mbstate_read,
+    // don't read new bytes yet
+    if (!cr.isPartiallyPopping()) {
+      while (!cr.isFull()) {
+        uint8_t byte;
+        auto read_res = read_unlocked_impl(&byte, 1);
+        if (read_res.has_error())
+          return {read_count, read_res.error};
+        if (read_res.value == 0) { // EOF
+          if (cr.isEmpty())
+            return {read_count, 0};
+          err = true;
+          return {read_count, EILSEQ}; // Incomplete character at EOF
+        }
+        int push_err = cr.push(static_cast<char8_t>(byte));
+        if (push_err != 0) {
+          err = true;
+          return {read_count, push_err};
+        }
       }
     }
-    auto pop_res = cr.pop<char32_t>();
-    if (!pop_res.has_value()) {
-      err = true;
-      return {read_count, pop_res.error()};
+    if (!cr.isEmpty()) {
+      auto pop_res = cr.pop<wchar_t>();
+      if (!pop_res.has_value()) {
+        err = true;
+        return {read_count, pop_res.error()};
+      }
+      ws[i] = pop_res.value();
+      ++read_count;
     }
-    ws[i] = static_cast<wchar_t>(pop_res.value());
-    ++read_count;
   }
   return {read_count, 0};
 }
@@ -651,7 +670,8 @@ ErrorOr<wint_t> File::ungetwc_unlocked(wint_t wc) {
   }
 
   char mb_buf[4];
-  auto result = internal::wcrtomb(mb_buf, static_cast<wchar_t>(wc), &mbstate);
+  auto result =
+      internal::wcrtomb(mb_buf, static_cast<wchar_t>(wc), &mbstate_read);
   if (!result.has_value())
     return Error(result.error());
 
@@ -676,6 +696,11 @@ ErrorOr<wint_t> File::ungetwc_unlocked(wint_t wc) {
   eof = false;
   err = false;
   return wc;
+}
+
+int File::check_mbstate_partial_push_unlocked() {
+  internal::CharacterConverter cr(&mbstate_write);
+  return cr.isValidState() && cr.isEmpty() ? 0 : EILSEQ;
 }
 
 } // namespace LIBC_NAMESPACE_DECL

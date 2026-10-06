@@ -120,7 +120,8 @@ private:
   bool err;
 
   Orientation orientation;
-  internal::mbstate mbstate;
+  internal::mbstate mbstate_write;
+  internal::mbstate mbstate_read;
 
 protected:
   constexpr bool write_allowed() const { return mode.write_allowed(); }
@@ -135,7 +136,8 @@ protected:
     eof = false;
     err = false;
     orientation = Orientation::UNORIENTED;
-    mbstate = internal::mbstate();
+    mbstate_write = internal::mbstate();
+    mbstate_read = internal::mbstate();
     adjust_buf();
   }
 
@@ -156,8 +158,8 @@ public:
         ungetc_buf{}, buf(buffer), bufsize(buffer_size), bufmode(buffer_mode),
         own_buf(owned), mode(mode), pos(0), prev_op(FileOp::NONE),
         read_limit(0), eof(false), err(false),
-        orientation(Orientation::UNORIENTED), mbstate(), prev(nullptr),
-        next(nullptr) {
+        orientation(Orientation::UNORIENTED), mbstate_write(), mbstate_read(),
+        prev(nullptr), next(nullptr) {
     adjust_buf();
   }
 
@@ -185,9 +187,17 @@ public:
 
   // If buffer has data written to it, flush it out. Does nothing if the
   // buffer is currently being used as a read buffer.
+  // (UTF-16) If mbstate_write still holds an unpaired high surrogate, flush
+  // the converted bytes in the buffer, but return EILSEQ to signal that the
+  // code unit cannot be encoded.
   int flush() {
     FileLock lock(this);
-    return flush_unlocked();
+    int result = flush_unlocked();
+    if (result == 0) check_mbstate_partial_push_unlocked();
+    if (result != 0) {
+      err = true;
+      return result;
+    }
   }
 
   int flush_unlocked();
@@ -299,6 +309,14 @@ private:
   FileIOResult read_unlocked_fbf(uint8_t *data, size_t len);
   FileIOResult read_unlocked_nbf(uint8_t *data, size_t len);
   size_t copy_data_from_buf(uint8_t *data, size_t len);
+
+  // (UTF-16) When flush() or close() is called, if mbstate_write still holds an
+  // unpaired high surrogate that was accepted by write_unlocked, we return
+  // EILSEQ: such a code unit cannot be encoded, so a boundary operation
+  // (fflush/fclose) must report that the data cannot be fully written. Only the
+  // write side is checked. A pending low surrogate on the read side just means
+  // the caller stopped halfway through a character, which is not an error.
+  int check_mbstate_partial_push_unlocked();
 
   constexpr void adjust_buf() {
     if (read_allowed() && (buf == nullptr || bufsize == 0)) {
